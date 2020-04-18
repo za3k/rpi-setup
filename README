@@ -7,10 +7,10 @@ This is a script which
 3. Writes that image to the (currently inserted) microsd card
 
 There are various configuration options which can be used to apply additional setup--run './pi-setup' with no options to view them all.
-  - `PACKAGES` - packages to install on the image
-  - `SSH_KEY` - location of your ssh private key for login
-  - `STATIC_IP` - assign a static IP
-  - `SETUP` - script to run once, after setup (default: 'apt update && apt -y upgrade')
+  - (broken) `PACKAGES` - packages to install on the image
+  - (working) `SSH_KEY` - location of your ssh private key for login
+  - (broken) `STATIC_IP` - assign a static IP
+  - (untested) `SETUP` - script to run once, after setup (default: 'apt update && apt -y upgrade')
 
 This is a fairly unsafe script (copies your wifi settings, automatically overwrites the currently inserted microsd) so use at your own risk.
 
