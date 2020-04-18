@@ -1,0 +1,312 @@
+#!/bin/sh
+# TODO: installing apt packages is racing with built-in system first boot processes
+# TODO: 'firstboot' should not be oneshot probably
+# TODO: Static IP config is not working
+# TODO: Support TAR
+# Update checklist: SOURCE_ZIP SOURCE_IMAGE SOURCE_ZIP_SHA256 SOURCE_IMAGE_SHA256 EXISTING_LINE NEW_LINE
+MICROSD=/dev/mmcblk0
+MOUNT_P1=/mnt
+MOUNT_P2=/mnt
+
+SOURCE_ZIP=2020-02-13-raspbian-buster-lite.zip # debian 10 - buster
+SOURCE_IMAGE=2020-02-13-raspbian-buster-lite.img
+SOURCE_ZIP_SHA256=12ae6e17bf95b6ba83beca61e7394e7411b45eba7e6a520f434b0748ea7370e8
+FINAL_IMAGE=built.img
+# If this is down, please switch to use torrents--don't automatically download from the main site like an asshole
+ZIP_URL=https://germinate.za3k.com/pub/distros/${SOURCE_ZIP}
+
+usage() {
+  echo "usage: WPA_SSID=<network> WPA_PASSWORD=<password> pi-setup HOSTNAME"
+  echo "   or:                 WPA_SUPPLICANT_CONF=<file> pi-setup HOSTNAME"
+  echo "environment variables:"
+  echo "  PASSWORD - password of the 'pi' account (default: randomize)"
+  echo "             use PASSWORD=raspberry to keep the base image password"
+  echo "  SSH_KEY - location of your ssh private key for login (default: $HOME/.ssh/id_rsa)"
+  echo "  WPA_SSID - this is the name of the wireless network to connect to"
+  echo "  WPA_PASSWORD - if WPA_SUPPLICANT_CONF=generate, this is the password used to connec to the wireless"
+  echo "  WPA_SUPPLICANT_CONF - file to install as /etc/wpa_supplicant.conf (default: none, generate)"
+  echo "                        or set WPA_SSID and WPA_PASSWORD"
+  echo "  STATIC_IP - assign a static IP instead of accepting the default DHCP of your wifi router"
+  echo ""
+  echo "  SETUP - script to run once, after setup (default: none)"
+  echo "  PACKAGES - packages to install on the image (default: update all packages, install none extra)"
+#  echo "  TAR - files to extract into the image"
+  exit 2
+}
+
+if [ $# -eq 1 ]; then
+  HOSTNAME="$1"
+else
+  usage && exit 2
+fi
+
+echo -n "downloading base image... " >&2
+if [ -f "${SOURCE_IMAGE}" ]; then
+  echo "skipped (${SOURCE_IMAGE})" >&2
+else
+  wget -q --continue "${ZIP_URL}"
+  if [ $? == 0 ]; then
+    echo "ok"
+  else
+    echo "failed"
+    rm -f "${SOURCE_ZIP}"
+    exit 1
+  fi
+  echo -n "verifying image checksum... " >&2
+  echo "${SOURCE_ZIP_SHA256}  ${SOURCE_ZIP}" | sha256sum --strict --status --check
+  if [ $? == 0 ]; then
+    echo "ok"
+  else
+    echo "failed"
+    exit 0
+    rm "${SOURCE_ZIP}"
+    exit 1
+  fi
+  echo -n "decompressing base image... " >&2
+  unzip -q "${SOURCE_ZIP}"
+  if [ $? == 0 ]; then
+    echo "ok"
+    rm "${SOURCE_ZIP}"
+  else
+    echo "failed"
+    rm -f "${SOURCE_IMAGE}" "${SOURCE_ZIP}"
+  fi
+fi
+
+# Copy the image
+echo -n "cloning image before making changes... " >&2
+cp "${SOURCE_IMAGE}" "${FINAL_IMAGE}"
+echo "ok"
+
+# Get sudo
+echo "asking for sudo credentials..."
+sudo -v
+
+# Mount FAT (p1)
+echo -n "loading loop device... " >&2
+sudo losetup -Pf ${FINAL_IMAGE}
+echo "ok" >&2
+echo -n "mounting filesystem (fat32, config) using loop device... " >&2
+sudo mount /dev/loop0p1 ${MOUNT_P1}
+echo "ok" >&2
+function unloop {
+  echo -n "unmounting current filesystem... " >&2
+  if [ ${MOUNT_P1} == ${MOUNT_P2} ]; then
+    sudo umount ${MOUNT_P1}
+  else
+    sudo umount ${MOUNT_P1} ${MOUNT_P2}
+  fi
+  echo "ok" >&2
+  echo -n "unloading loop device... " >&2
+  sudo losetup -d /dev/loop0
+  echo "ok" >&2
+}
+trap unloop EXIT SIGINT SIGTERM SIGHUP
+
+# Enable SSH
+echo -n "enabling ssh daemon... " >&2
+sudo touch ${MOUNT_P1}/ssh
+echo "ok"
+
+# Set static IP
+# TODO: does not work
+echo -n "setting static ip... " >&2
+if [ -z "${STATIC_IP}" ]; then
+  echo "skipping"
+else
+  sudo sed -i'' -z 's/\n//' ${MOUNT_P1}/cmdline.txt
+  echo " ip=${STATIC_IP}" | sudo tee -a ${MOUNT_P1}/cmdline.txt >/dev/null
+  echo "ok (broken)"
+fi
+
+# Copy over wireless config
+WPA_SUPPLICANT_CONF=${WPA_SUPPLICANT_CONF:-generate}
+echo -n "setting up network configuration... " >&2
+if [ "${WPA_SUPPLICANT_CONF}" == "generate" -a "${WPA_SSID}" != "" -a "${WPA_PASSWORD}" != "" ]; then
+  # Don't indent with spaces here or wpa_supplicant refuses to load the file
+  sudo tee ${MOUNT_P1}/wpa_supplicant.conf >/dev/null <<EOF
+country=US # needed for Pi 3B+
+ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev # Needed for buster and above
+update_config=1 # Not really needed but it's fine
+network={
+ssid="${WPA_SSID}"
+psk="${WPA_PASSWORD}"
+key_mgmt=WPA-PSK
+}
+EOF
+  echo "ok" >&2
+elif [ -e "${WPA_SUPPLICANT_CONF}" ]; then
+  sudo cp "${WPA_SUPPLICANT_CONF}" ${MOUNT_P1}/wpa_supplicant.conf
+  echo "ok" >&2
+else
+  echo -n "skipping" >&2
+fi
+
+# Mount ext (p2)
+echo -n "unmounting filesystem (fat32, config)... " >&2
+sudo umount ${MOUNT_P1}
+echo "ok" >&2
+echo -n "mounting filesystem (ext4, linux) using loop device... " >&2
+sudo mount /dev/loop0p2 ${MOUNT_P2}
+echo "ok" >&2
+
+# Change pi user password
+echo -n "changing 'pi' user password... "
+WORD_DICT=${WORD_DICT:-/usr/share/dict/words}
+if [ -z "${PASSWORD}" ]; then
+  if [ -f "${WORD_DICT}" ]; then
+    PASSWORD=`shuf -r "${WORD_DICT}" | sed -e "/[^a-z]/d" | head -n 5 | tr "\n" " " | head -c-1`
+  else
+    PASSWORD=`tr -dc "A-Za-z0-9" </dev/urandom | head -c 13`
+  fi
+fi
+SALT=`tr -dc "A-Za-z0-9" </dev/urandom | head -c 6`
+
+EXISTING_LINE="pi:`openssl passwd -6 -salt 1v7ih/Dwb/jLeK85 raspberry`:18305:0:99999:7:::"
+NEW_LINE="pi:`openssl passwd -6 -salt ${SALT} "${PASSWORD}"`:18305:0:99999:7:::"
+FOUND_MATCH=0
+sudo cp ${MOUNT_P2}/etc/shadow /tmp/pi-shadowref
+sudo chmod 644 ${MOUNT_P2}/etc/shadow
+while read x; do
+  if [ "${x}" == "${EXISTING_LINE}" ]; then
+    FOUND_MATCH=1
+    echo "$NEW_LINE"
+  else
+    echo "${x}"
+  fi
+done <${MOUNT_P2}/etc/shadow >/tmp/pi-shadow
+if [ "${FOUND_MATCH}" == "0" ]; then
+  echo "failed, skipping" >&2
+else
+  sudo chown --reference=/tmp/pi-shadowref /tmp/pi-shadow
+  sudo chmod --reference=/tmp/pi-shadowref /tmp/pi-shadow
+  sudo rm /tmp/pi-shadowref
+  sudo mv /tmp/pi-shadow ${MOUNT_P2}/etc/shadow
+  if [[ -t 0 || -p /dev/stdin ]]; then
+    echo "[35m${PASSWORD}[0m" >&2
+  else
+    echo "${PASSWORD}" >&2
+  fi
+fi
+
+# Set up hostname
+echo -n "setting hostname... " >&2
+echo "${HOSTNAME}" | sudo tee ${MOUNT_P2}/etc/hostname >/dev/null
+sudo sed -e "s/raspberrypi/${HOSTNAME}/g" -i'' ${MOUNT_P2}/etc/hosts
+echo "ok" >&2
+
+# Set up ssh authorized_keys
+echo -n "setting up ssh authorized keys... " >&2
+sudo mkdir ${MOUNT_P2}/home/pi/.ssh
+sudo chmod 700 ${MOUNT_P2}/home/pi/.ssh
+sudo chown 1000:1000 ${MOUNT_P2}/home/pi/.ssh
+PUBLIC_KEY="${SSH_KEY:-${HOME}/.ssh/id_rsa}"
+if [ -f "${SSH_KEY}.pub" ]; then
+  cat "${SSH_KEY}.pub" | sudo tee ${MOUNT_P2}/home/pi/.ssh/authorized_keys >/dev/null
+  sudo chown 1000:1000 ${MOUNT_P2}/home/pi/.ssh/authorized_keys
+  sudo chmod 600 ${MOUNT_P2}/home/pi/.ssh/authorized_keys
+  echo "ok" >&2
+else
+  echo "not found" >&2
+fi
+
+# TODO: Extract (optional) tar of additional files [or maybe directory too]
+# TODO: Set up tunnel home if wanted
+#if [ `hostname` == rosemary ]; then
+#  echo -n "setting up tunnel-home script... " >&2
+#  echo "not implemented, skipping" >&2
+#fi
+
+FIRSTBOOT="/usr/bin/firstboot.sh"
+install_script() {
+  if [[ -f "${MOUNT_P2}${FIRSTBOOT}" ]]; then
+    :
+  else
+    echo "#!/bin/sh" | sudo tee ${MOUNT_P2}${FIRSTBOOT} >/dev/null
+    sudo chmod +x ${MOUNT_P2}${FIRSTBOOT}
+    sudo tee ${MOUNT_P2}/lib/systemd/system/firstboot.service >/dev/null <<EOF
+[Unit]
+Description=first boot
+After=network.target
+Before=rc-local.service
+ConditionFileNotEmpty=${FIRSTBOOT}
+
+[Service]
+ExecStart=${FIRSTBOOT}
+ExecStartPost=/bin/mv ${FIRSTBOOT} ${FIRSTBOOT}.done
+Type=oneshot
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo ln -s /lib/systemd/system/firstboot.service ${MOUNT_P2}/etc/systemd/system/multi-user.target.wants/
+  fi
+  sudo tee -a ${MOUNT_P2}${FIRSTBOOT} >/dev/null
+  #echo "$1 && rm /etc/profile.d/$2.sh" | sudo tee ${MOUNT_P2}/etc/profile.d/$2.sh >/dev/null
+}
+
+# Add script to auto-update apt
+echo -n "adding script to autoupdate on first boot... " >&2
+echo "skipping (broken)" >&2
+# TODO: Races with another first-boot thing for access to apt
+#echo -e "#!/bin/sh\napt-get update && apt-get -y upgrade" | install_script
+#echo "ok"
+
+# Add (optional) list of packages to installed
+echo -n "adding script to install packages on first boot... " >&2
+if [ -z "$PACKAGES" ]; then
+  echo "skipping" >&2
+else
+  #echo -e "#!/bin/sh\napt-get install -y ${PACKAGES}" | install_script
+  #echo "ok" >&2
+  echo "skipping (broken)" >&2
+fi
+
+# Add (optional) script which will auto-run, once
+# TODO: Test
+echo -n "adding custom script which will run on first boot... " >&2
+if [ -z "${SCRIPT}" ]; then
+  echo "skipping" >&2
+elif [ -e "${SCRIPT}" ]; then
+  sudo tee ${MOUNT_P2}/usr/bin/first-boot-script <${SCRIPT} >/dev/null
+  echo -e "#!/bin/sh\n/usr/bin/first-boot-script" | install_script
+  echo "ok" >&2
+else
+  echo "failed" >&2
+fi
+
+# Unmount the image
+echo -n "unmounting filesystem (ext4, linux)... " >&2
+sudo umount ${MOUNT_P2}
+echo "ok" >&2
+echo -n "unloading loop device... " >&2
+sudo losetup -d /dev/loop0
+echo "ok" >&2
+trap - EXIT SIGINT SIGTERM SIGHUP
+
+# Write the image
+echo -n "writing image to microsd... " >&2
+if [ -e ${MICROSD} ]; then
+  sudo dd if=${FINAL_IMAGE} of=${MICROSD} bs=1M 2>/dev/null
+  echo "ok" >&2
+  echo "" >&2
+  echo "you may wish to delete ${FINAL_IMAGE}" >&2
+else
+  echo "skipped" >&2
+  echo "" >&2
+  echo "to write the image, insert a microsd and run:"
+  echo "  dd if=${FINAL_IMAGE} of=${MICROSD} bs=1M status=progress"
+fi
+echo "label your raspberry pi '${HOSTNAME}' and boot from it now" >&2
+echo "to connect to your pi, run:" >&2
+echo -n "  ssh " >&2
+[ -z "${SSH_KEY}" ] || echo -n "-i ${SSH_KEY} " >&2
+echo -n "pi@" >&2
+if [ -z "${STATIC_IP}" ]; then
+  echo -n "<pi's dhcp/ipv6 ip>" >&2
+else
+  echo -n "${STATIC_IP}" >&2
+fi
+echo "" >&2
+[ -z "${STATIC_IP}" ] && echo "note: the pi's ip address is printed on screen on boot. if you don't see one, your wifi configuration is wrong." >&2

@@ -1,0 +1,21 @@
+Usage: pi-setup HOSTNAME
+
+This is a script which
+
+1. Downloads the latest raspberry pi image
+2. Configures it to turn on SSH and wifi, and sets a random password on the 'pi' user
+3. Writes that image to the (currently inserted) microsd card
+
+There are various configuration options which can be used to apply additional setup--run './pi-setup' with no options to view them all.
+  - `PACKAGES` - packages to install on the image
+  - `SSH_KEY` - location of your ssh private key for login
+  - `STATIC_IP` - assign a static IP
+  - `SETUP` - script to run once, after setup (default: 'apt update && apt -y upgrade')
+
+This is a fairly unsafe script (copies your wifi settings, automatically overwrites the currently inserted microsd) so use at your own risk.
+
+Examples:
+    # Minimal setup
+    WPA_SSID=Outpost WPA_PASSWORD=fakepassword ./pi-setup printserver
+    # Install packages, set up a static ip so we can ssh to it headless easier, and set up ssh keys.
+    PACKAGES="vim tmux" STATIC_IP=192.168.1.52 SSH_KEY=$HOME/.ssh/tarragon2017 WPA_SSID=Outpost WPA_PASSWORD=fakepassword ./pi-setup printserver
